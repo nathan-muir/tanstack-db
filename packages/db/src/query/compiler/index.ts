@@ -1246,12 +1246,15 @@ function compileQueryInternal(
     const callbackSelected = query.fnSelect
       ? (row as { [CALLBACK_SELECTED]?: unknown })[CALLBACK_SELECTED]
       : attachVirtualPropsToSelected(
-          transformPublicContainers(
-            selectedValue,
-            (value) =>
-              sourceViews.find(([alias]) => value === row[alias])?.[1] ?? value,
-            NO_OMITTED_KEYS,
-          ),
+          sourceViews.length === 0
+            ? selectedValue
+            : transformPublicContainers(
+                selectedValue,
+                (value) =>
+                  sourceViews.find(([alias]) => value === row[alias])?.[1] ??
+                  value,
+                NO_OMITTED_KEYS,
+              ),
           callbackRow,
           true,
           metadataSource,

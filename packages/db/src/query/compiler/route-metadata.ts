@@ -191,6 +191,8 @@ export function transformPublicContainers(
   const rootReplacement = transformLeaf(value)
   if (!Object.is(rootReplacement, value)) return rootReplacement
   if (!isPublicContainer(value)) return value
+  if (!needsTransform(value, transformLeaf, omittedKeys, new Set()))
+    return value
 
   const containers = new Map<object, PublicContainer>()
   const queue: Array<PublicContainer> = []
@@ -246,6 +248,66 @@ export function transformPublicContainers(
   return copy(root)
 }
 
+/**
+ * Whether transformPublicContainers would change anything under value: a reserved key
+ * to omit, or a leaf the transform replaces. Reads enumerable values only, so the common
+ * case (plain row data, nothing to strip) allocates nothing.
+ */
+function needsTransform(
+  value: object,
+  transformLeaf: (value: unknown) => unknown,
+  omittedKeys: ReadonlySet<PropertyKey>,
+  seen: Set<object>,
+): boolean {
+  if (seen.has(value)) return false
+  seen.add(value)
+  for (const symbol of Object.getOwnPropertySymbols(value)) {
+    if (omittedKeys.has(symbol)) return true
+    if (!Object.prototype.propertyIsEnumerable.call(value, symbol)) continue
+    if (
+      childNeedsTransform(
+        (value as Record<PropertyKey, unknown>)[symbol],
+        transformLeaf,
+        omittedKeys,
+        seen,
+      )
+    )
+      return true
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!(index in value)) continue
+      if (childNeedsTransform(value[index], transformLeaf, omittedKeys, seen))
+        return true
+    }
+    return false
+  }
+  for (const key of Object.keys(value)) {
+    if (omittedKeys.has(key)) return true
+    if (
+      childNeedsTransform(
+        (value as Record<PropertyKey, unknown>)[key],
+        transformLeaf,
+        omittedKeys,
+        seen,
+      )
+    )
+      return true
+  }
+  return false
+}
+function childNeedsTransform(
+  child: unknown,
+  transformLeaf: (value: unknown) => unknown,
+  omittedKeys: ReadonlySet<PropertyKey>,
+  seen: Set<object>,
+): boolean {
+  if (!Object.is(transformLeaf(child), child)) return true
+  return (
+    isPublicContainer(child) &&
+    needsTransform(child, transformLeaf, omittedKeys, seen)
+  )
+}
 export function isPublicContainer(value: unknown): value is object {
   return Array.isArray(value) || isPlainObject(value)
 }
