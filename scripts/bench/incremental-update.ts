@@ -49,6 +49,27 @@ type Comment = {
   updateTick: number
 }
 
+// A rich-text body: a row whose value is a deep tree rather than a few scalars.
+type IssueDocument = {
+  id: number
+  issueId: number
+  blocks: Array<DocumentBlock>
+  updateTick: number
+}
+
+type DocumentBlock = {
+  id: string
+  kind: `paragraph` | `heading` | `list`
+  text: string
+  marks: Array<{
+    type: `bold` | `link`
+    from: number
+    to: number
+    attrs: { href?: string }
+  }>
+  attrs: { indent: number; align: `left` | `center` }
+}
+
 type ManualSyncUtils<T extends object, TKey extends string | number> = {
   begin: Parameters<SyncConfig<T, TKey>[`sync`]>[0][`begin`]
   write: (message: ChangeMessageOrDeleteKeyMessage<T, TKey>) => void
@@ -67,9 +88,11 @@ type Fixture = {
   issues: ManualCollection<Issue, number>
   users: ManualCollection<User, number>
   comments: ManualCollection<Comment, number>
+  documents: ManualCollection<IssueDocument, number>
   issueById: Map<number, Issue>
   userById: Map<number, User>
   commentById: Map<number, Comment>
+  documentById: Map<number, IssueDocument>
   visibleIssueId: number
   selectedIssueId: number
   nextCommentId: number
@@ -163,6 +186,9 @@ const defaultCustomScale: FixtureScale = {
 }
 
 const options = parseArgs(process.argv.slice(2), defaultOptions)
+
+const BLOCKS_PER_DOCUMENT = 20
+const BLOCK_KINDS = [`heading`, `paragraph`, `paragraph`, `list`] as const
 
 const queryCases: Array<QueryCase> = [
   {
@@ -302,6 +328,27 @@ const queryCases: Array<QueryCase> = [
           })),
       ) as unknown as BenchmarkCollection,
     write: insertSelectedIssueComment,
+  },
+  {
+    name: `open issues + documents`,
+    scenario: `visible document update`,
+    // Every open issue with its whole document and no limit, so each output row
+    // carries a nested tree into result finalization.
+    createQuery: ({ issues, documents }) =>
+      createLiveQueryCollection((q) =>
+        q
+          .from({ issue: issues })
+          .where(({ issue }) => eq(issue.status, `open`))
+          .join({ document: documents }, ({ issue, document }) =>
+            eq(issue.id, document.issueId),
+          )
+          .select(({ issue, document }) => ({
+            id: issue.id,
+            title: issue.title,
+            document,
+          })),
+      ) as unknown as BenchmarkCollection,
+    write: updateVisibleDocument,
   },
 ]
 
@@ -468,6 +515,13 @@ function createFixture(options: BenchmarkRunOptions): Fixture {
     })
   }
 
+  const documentsData: Array<IssueDocument> = issuesData.map((issue) => ({
+    id: issue.id,
+    issueId: issue.id,
+    blocks: createDocumentBlocks(issue.id, random),
+    updateTick: 0,
+  }))
+
   const fixture = {
     seed: options.seed,
     issues: createManualCollection(
@@ -491,6 +545,15 @@ function createFixture(options: BenchmarkRunOptions): Fixture {
     issueById: new Map(issuesData.map((issue) => [issue.id, issue])),
     userById: new Map(usersData.map((user) => [user.id, user])),
     commentById: new Map(commentsData.map((comment) => [comment.id, comment])),
+    documents: createManualCollection(
+      `bench-documents`,
+      documentsData,
+      (document) => document.id,
+      options.sourceIndexMode,
+    ),
+    documentById: new Map(
+      documentsData.map((document) => [document.id, document]),
+    ),
     visibleIssueId,
     selectedIssueId,
     nextCommentId: options.commentCount + 1,
@@ -514,6 +577,70 @@ function applySourceIndexes(
   fixture.users.createIndex((user) => user.id)
   fixture.comments.createIndex((comment) => comment.issueId)
   fixture.comments.createIndex((comment) => comment.createdAt)
+  fixture.documents.createIndex((document) => document.issueId)
+}
+
+function createDocumentBlocks(
+  issueId: number,
+  random: () => number,
+): Array<DocumentBlock> {
+  const blocks: Array<DocumentBlock> = []
+  for (let index = 0; index < BLOCKS_PER_DOCUMENT; index++) {
+    const length = 40 + Math.floor(random() * 80)
+    blocks.push({
+      id: `${issueId}-${index}`,
+      kind: BLOCK_KINDS[index % BLOCK_KINDS.length]!,
+      text: `Block ${index} of issue ${issueId}`.padEnd(length, `.`),
+      marks: [
+        { type: `bold`, from: 0, to: 5, attrs: {} },
+        {
+          type: `link`,
+          from: 6,
+          to: 12,
+          attrs: { href: `https://example.com/${issueId}/${index}` },
+        },
+      ],
+      attrs: { indent: index % 3, align: index === 0 ? `center` : `left` },
+    })
+  }
+  return blocks
+}
+
+function updateVisibleDocument(
+  fixture: Fixture,
+  iteration: number,
+  mutationMode: MutationMode,
+): WriteResult {
+  const document = fixture.documentById.get(fixture.visibleIssueId)!
+  const [first, ...rest] = document.blocks
+  const next = {
+    ...document,
+    blocks: [{ ...first!, text: `Edited at tick ${iteration}` }, ...rest],
+    updateTick: iteration,
+  }
+  fixture.documentById.set(document.id, next)
+
+  if (mutationMode === `synced`) {
+    writeSync(fixture.documents, {
+      type: `update`,
+      value: next,
+    })
+    return
+  }
+
+  const transaction = writeOptimistic(() => {
+    fixture.documents.update(document.id, (draft) => {
+      draft.blocks = next.blocks
+      draft.updateTick = next.updateTick
+    })
+  })
+
+  return {
+    cleanup: () => {
+      transaction.rollback()
+      fixture.documentById.set(document.id, document)
+    },
+  }
 }
 
 function updateVisibleIssue(
@@ -706,6 +833,7 @@ async function cleanupFixture(
     fixture.issues.cleanup(),
     fixture.users.cleanup(),
     fixture.comments.cleanup(),
+    fixture.documents.cleanup(),
   ])
 }
 
